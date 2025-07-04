@@ -157,3 +157,18 @@ hold off;
 
 stereoParamsStruct = toStruct(stereoParams);
 save('stereoParamsStruct.mat', 'stereoParamsStruct');
+
+
+
+%{    OUTPUT WHEN CHECKING CONTENTS IN python
+
+C:\Users\sybanzon\Documents\schoolFiles\RESERARCH\calibration> & C:/Python312/python.exe c:/Users/sybanzon/Documents/schoolFiles/RESERARCH/calibration/claudecalib.py
+Top-level keys in .mat file:
+  stereoParamsStruct: <class 'numpy.ndarray'>
+
+Fields in 'stereoParamsStruct':
+[('CameraParameters1', 'O'), ('CameraParameters2', 'O'), ('RotationOfCamera2', 
+'O'), ('TranslationOfCamera2', 'O'), ('Version', 'O'), ('RectificationParams', 
+'O')]
+
+%}
