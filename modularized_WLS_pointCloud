@@ -1,0 +1,512 @@
+import numpy as np
+import cv2
+from typing import Tuple, Optional, Union
+import os
+
+
+class StereoCalibrationLoader:
+    """Handles loading and managing stereo calibration parameters."""
+    
+    def __init__(self, params_file: str):
+        """
+        Initialize with calibration parameters file.
+        
+        Args:
+            params_file: Path to the .npz file containing calibration parameters
+        """
+        self.params_file = params_file
+        self.params = None
+        self._load_parameters()
+    
+    def _load_parameters(self):
+        """Load calibration parameters from file."""
+        if not os.path.exists(self.params_file):
+            raise FileNotFoundError(f"Calibration file not found: {self.params_file}")
+        
+        self.params = np.load(self.params_file)
+        
+        # Extract all parameters
+        self.camera_matrix_1 = self.params['camera_matrix_1']
+        self.dist_coeffs_1 = self.params['dist_coeffs_1']
+        self.camera_matrix_2 = self.params['camera_matrix_2']
+        self.dist_coeffs_2 = self.params['dist_coeffs_2']
+        self.R1 = self.params['R1']
+        self.R2 = self.params['R2']
+        self.P1 = self.params['P1']
+        self.P2 = self.params['P2']
+        self.Q = self.params['Q']
+        self.image_size = tuple(self.params['image_size'])
+    
+    def generate_rectification_maps(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Generate rectification maps for both cameras.
+        
+        Returns:
+            Tuple of (map1x, map1y, map2x, map2y)
+        """
+        map1x, map1y = cv2.initUndistortRectifyMap(
+            self.camera_matrix_1, self.dist_coeffs_1, self.R1, self.P1, 
+            self.image_size, cv2.CV_32FC1
+        )
+        
+        map2x, map2y = cv2.initUndistortRectifyMap(
+            self.camera_matrix_2, self.dist_coeffs_2, self.R2, self.P2, 
+            self.image_size, cv2.CV_32FC1
+        )
+        
+        return map1x, map1y, map2x, map2y
+
+
+class StereoImageProcessor:
+    """Handles stereo image loading, preprocessing, and rectification."""
+    
+    def __init__(self, calibration_loader: StereoCalibrationLoader):
+        """
+        Initialize with calibration loader.
+        
+        Args:
+            calibration_loader: Instance of StereoCalibrationLoader
+        """
+        self.calibration = calibration_loader
+        self.map1x, self.map1y, self.map2x, self.map2y = self.calibration.generate_rectification_maps()
+    
+    def load_combined_stereo_image(self, image_path: str) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Load and split a combined stereo image into left and right images.
+        
+        Args:
+            image_path: Path to the combined stereo image
+            
+        Returns:
+            Tuple of (left_image, right_image)
+        """
+        img_combined = cv2.imread(image_path)
+        if img_combined is None:
+            raise FileNotFoundError(f"Combined stereo image not found: {image_path}")
+        
+        h, w = img_combined.shape[:2]
+        img_left = img_combined[:, :w//2]
+        img_right = img_combined[:, w//2:]
+        
+        return img_left, img_right
+    
+    def load_separate_images(self, left_path: str, right_path: str) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Load separate left and right stereo images.
+        
+        Args:
+            left_path: Path to left image
+            right_path: Path to right image
+            
+        Returns:
+            Tuple of (left_image, right_image)
+        """
+        img_left = cv2.imread(left_path)
+        img_right = cv2.imread(right_path)
+        
+        if img_left is None:
+            raise FileNotFoundError(f"Left image not found: {left_path}")
+        if img_right is None:
+            raise FileNotFoundError(f"Right image not found: {right_path}")
+        
+        return img_left, img_right
+    
+    def rectify_images(self, img_left: np.ndarray, img_right: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Rectify stereo image pair.
+        
+        Args:
+            img_left: Left stereo image
+            img_right: Right stereo image
+            
+        Returns:
+            Tuple of (rectified_left, rectified_right)
+        """
+        rect_left = cv2.remap(img_left, self.map1x, self.map1y, interpolation=cv2.INTER_LINEAR)
+        rect_right = cv2.remap(img_right, self.map2x, self.map2y, interpolation=cv2.INTER_LINEAR)
+        
+        return rect_left, rect_right
+    
+    def preprocess_for_matching(self, rect_left: np.ndarray, rect_right: np.ndarray, 
+                              equalize_hist: bool = True) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Preprocess rectified images for stereo matching.
+        
+        Args:
+            rect_left: Rectified left image
+            rect_right: Rectified right image
+            equalize_hist: Whether to apply histogram equalization
+            
+        Returns:
+            Tuple of (processed_left, processed_right) in grayscale
+        """
+        gray_left = cv2.cvtColor(rect_left, cv2.COLOR_BGR2GRAY)
+        gray_right = cv2.cvtColor(rect_right, cv2.COLOR_BGR2GRAY)
+        
+        if equalize_hist:
+            gray_left = cv2.equalizeHist(gray_left)
+            gray_right = cv2.equalizeHist(gray_right)
+        
+        return gray_left, gray_right
+
+
+class DepthMapGenerator:
+    """Handles stereo matching and depth map generation through disparity computation."""
+    
+    def __init__(self, min_disp: int = 0, max_disp: int = 128, block_size: int = 7):
+        """
+        Initialize stereo matcher parameters.
+        
+        Args:
+            min_disp: Minimum disparity
+            max_disp: Maximum disparity (must be divisible by 16 for SGBM)
+            block_size: Block size for matching (odd number)
+        """
+        self.min_disp = min_disp
+        self.max_disp = max_disp
+        self.block_size = block_size
+        
+        # Ensure num_disparities is divisible by 16
+        self.num_disparities = max_disp - min_disp
+        if self.num_disparities % 16 != 0:
+            self.num_disparities = ((self.num_disparities // 16) + 1) * 16
+    
+    def create_sgbm_matcher(self) -> cv2.StereoSGBM:
+        """
+        Create SGBM stereo matcher for depth map generation.
+        
+        Returns:
+            Configured SGBM matcher
+        """
+        return cv2.StereoSGBM_create(
+            minDisparity=self.min_disp,
+            numDisparities=self.num_disparities,
+            blockSize=self.block_size,
+            P1=8 * 3 * self.block_size ** 2,
+            P2=32 * 3 * self.block_size ** 2,
+            disp12MaxDiff=1,
+            uniquenessRatio=10,
+            speckleWindowSize=100,
+            speckleRange=32,
+            preFilterCap=63,
+            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY
+        )
+    
+    def compute_depth_map_with_wls(self, gray_left: np.ndarray, gray_right: np.ndarray,
+                                  lambda_val: float = 8000, sigma_color: float = 1.5) -> np.ndarray:
+        """
+        Compute depth map using SGBM with WLS post-filtering.
+        
+        Args:
+            gray_left: Left grayscale image
+            gray_right: Right grayscale image
+            lambda_val: WLS filter lambda parameter
+            sigma_color: WLS filter sigma color parameter
+            
+        Returns:
+            Filtered disparity map (depth map)
+        """
+        # Create matchers
+        left_matcher = self.create_sgbm_matcher()
+        right_matcher = cv2.ximgproc.createRightMatcher(left_matcher)
+        
+        # Create WLS filter
+        wls_filter = cv2.ximgproc.createDisparityWLSFilter(matcher_left=left_matcher)
+        wls_filter.setLambda(lambda_val)
+        wls_filter.setSigmaColor(sigma_color)
+        
+        # Compute disparities
+        disparity_left = left_matcher.compute(gray_left, gray_right).astype(np.int16)
+        disparity_right = right_matcher.compute(gray_right, gray_left).astype(np.int16)
+        
+        # Apply WLS filter
+        disparity_wls = wls_filter.filter(disparity_left, gray_left, None, disparity_right)
+        
+        return disparity_wls
+
+
+class StereoVisualizer:
+    """Handles visualization of stereo processing results."""
+    
+    @staticmethod
+    def create_rectification_visualization(rect_left: np.ndarray, rect_right: np.ndarray, 
+                                         scale: float = 0.5, line_spacing: int = 50) -> np.ndarray:
+        """
+        Create side-by-side visualization with horizontal lines to verify rectification.
+        
+        Args:
+            rect_left: Rectified left image
+            rect_right: Rectified right image
+            scale: Display scale factor
+            line_spacing: Spacing between horizontal lines in pixels
+            
+        Returns:
+            Combined visualization image
+        """
+        # Resize for display
+        rect_left_small = cv2.resize(rect_left, (0, 0), fx=scale, fy=scale)
+        rect_right_small = cv2.resize(rect_right, (0, 0), fx=scale, fy=scale)
+        
+        # Stack side by side
+        rect_pair = np.hstack((rect_left_small, rect_right_small))
+        
+        # Draw horizontal lines
+        line_color = (0, 0, 255)  # Red in BGR
+        thickness = 1
+        height = rect_pair.shape[0]
+        
+        for y in range(0, height, line_spacing):
+            cv2.line(rect_pair, (0, y), (rect_pair.shape[1], y), line_color, thickness)
+        
+        return rect_pair
+    
+    @staticmethod
+    def create_disparity_difference(gray_left: np.ndarray, gray_right: np.ndarray, 
+                                  target_size: Tuple[int, int] = (854, 480)) -> np.ndarray:
+        """
+        Create absolute difference visualization between rectified images.
+        
+        Args:
+            gray_left: Left grayscale image
+            gray_right: Right grayscale image
+            target_size: Target size for display (width, height)
+            
+        Returns:
+            Resized difference image
+        """
+        rectified_diff = cv2.absdiff(gray_left, gray_right)
+        resized_diff = cv2.resize(rectified_diff, target_size, interpolation=cv2.INTER_AREA)
+        return resized_diff
+    
+    @staticmethod
+    def normalize_disparity_for_display(disparity: np.ndarray, 
+                                      colormap: int = cv2.COLORMAP_JET) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Normalize disparity map for display.
+        
+        Args:
+            disparity: Raw disparity map
+            colormap: OpenCV colormap to apply
+            
+        Returns:
+            Tuple of (normalized_grayscale, colored_disparity)
+        """
+        # Normalize to 0-255 range
+        disp_normalized = cv2.normalize(disparity, None, 0, 255, cv2.NORM_MINMAX)
+        disp_normalized = np.uint8(disp_normalized)
+        
+        # Apply colormap
+        disp_color = cv2.applyColorMap(disp_normalized, colormap)
+        
+        return disp_normalized, disp_color
+    
+    @staticmethod
+    def display_images(images_dict: dict, window_size: Tuple[int, int] = (854, 480)):
+        """
+        Display multiple images in separate windows.
+        
+        Args:
+            images_dict: Dictionary with window_name -> image pairs
+            window_size: Size for resizable windows (width, height)
+        """
+        for window_name, image in images_dict.items():
+            cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+            cv2.resizeWindow(window_name, window_size[0], window_size[1])
+            cv2.imshow(window_name, image)
+
+
+class PointCloudGenerator:
+    """Handles 3D point cloud generation from disparity maps."""
+    
+    def __init__(self, Q: np.ndarray):
+        """
+        Initialize with rectification matrix Q.
+        
+        Args:
+            Q: 4x4 rectification matrix from stereo calibration
+        """
+        self.Q = Q
+    
+    def generate_point_cloud(self, disparity: np.ndarray, color_image: np.ndarray, 
+                           min_disparity_threshold: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Generate 3D point cloud from disparity map.
+        
+        Args:
+            disparity: Disparity map
+            color_image: Corresponding color image
+            min_disparity_threshold: Minimum disparity threshold (if None, uses disparity.min())
+            
+        Returns:
+            Tuple of (3D_points, colors)
+        """
+        # Reproject points to 3D space
+        points_3D = cv2.reprojectImageTo3D(disparity, self.Q)
+        
+        # Create mask for valid disparities
+        if min_disparity_threshold is None:
+            min_disparity_threshold = disparity.min()
+        
+        mask = disparity > min_disparity_threshold
+        
+        # Apply mask to points and colors
+        output_points = points_3D[mask]
+        output_colors = color_image[mask]
+        
+        return output_points, output_colors
+    
+    @staticmethod
+    def save_point_cloud_ply(filename: str, points: np.ndarray, colors: np.ndarray):
+        """
+        Save point cloud to PLY file format.
+        
+        Args:
+            filename: Output filename
+            points: 3D points array
+            colors: Color array (BGR format)
+        """
+        points = points.reshape(-1, 3)
+        colors = colors.reshape(-1, 3)
+        
+        ply_header = '''ply
+format ascii 1.0
+element vertex %(vert_num)d
+property float x
+property float y
+property float z
+property uchar blue
+property uchar green
+property uchar red
+end_header
+'''
+        
+        verts = np.hstack([points, colors])
+        
+        with open(filename, 'w') as f:
+            f.write(ply_header % dict(vert_num=len(verts)))
+            np.savetxt(f, verts, fmt='%f %f %f %d %d %d')
+
+
+class StereoVisionPipeline:
+    """Main pipeline class that orchestrates the entire stereo vision process."""
+    
+    def __init__(self, calibration_file: str):
+        """
+        Initialize the stereo vision pipeline.
+        
+        Args:
+            calibration_file: Path to calibration parameters file
+        """
+        self.calibration_loader = StereoCalibrationLoader(calibration_file)
+        self.image_processor = StereoImageProcessor(self.calibration_loader)
+        self.depth_map_generator = DepthMapGenerator()
+        self.visualizer = StereoVisualizer()
+        self.point_cloud_generator = PointCloudGenerator(self.calibration_loader.Q)
+    
+    def process_stereo_images(self, image_path: str = None, left_path: str = None, 
+                            right_path: str = None, save_point_cloud: bool = False,
+                            point_cloud_filename: str = "output_point_cloud.ply") -> dict:
+        """
+        Complete stereo vision processing pipeline.
+        
+        Args:
+            image_path: Path to combined stereo image (if using combined format)
+            left_path: Path to left image (if using separate images)
+            right_path: Path to right image (if using separate images)
+            save_point_cloud: Whether to save point cloud to file
+            point_cloud_filename: Filename for saved point cloud
+            
+        Returns:
+            Dictionary containing processed results
+        """
+        # Load images
+        if image_path:
+            img_left, img_right = self.image_processor.load_combined_stereo_image(image_path)
+        elif left_path and right_path:
+            img_left, img_right = self.image_processor.load_separate_images(left_path, right_path)
+        else:
+            raise ValueError("Either image_path or both left_path and right_path must be provided")
+        
+        # Rectify images
+        rect_left, rect_right = self.image_processor.rectify_images(img_left, img_right)
+        
+        # Preprocess for matching
+        gray_left, gray_right = self.image_processor.preprocess_for_matching(rect_left, rect_right)
+        
+        # Generate depth map
+        depth_map = self.depth_map_generator.compute_depth_map_with_wls(gray_left, gray_right)
+        
+        # Create visualizations
+        rect_visualization = self.visualizer.create_rectification_visualization(rect_left, rect_right)
+        diff_visualization = self.visualizer.create_disparity_difference(gray_left, gray_right)
+        disp_gray, disp_color = self.visualizer.normalize_disparity_for_display(depth_map)
+        
+        # Generate point cloud if requested
+        point_cloud_data = None
+        if save_point_cloud:
+            points_3D, colors = self.point_cloud_generator.generate_point_cloud(depth_map, rect_left)
+            self.point_cloud_generator.save_point_cloud_ply(point_cloud_filename, points_3D, colors)
+            point_cloud_data = (points_3D, colors)
+            print(f"Point cloud saved to '{point_cloud_filename}'")
+        
+        return {
+            'rectified_left': rect_left,
+            'rectified_right': rect_right,
+            'gray_left': gray_left,
+            'gray_right': gray_right,
+            'depth_map': depth_map,
+            'rectification_visualization': rect_visualization,
+            'difference_visualization': diff_visualization,
+            'disparity_grayscale': disp_gray,
+            'disparity_colored': disp_color,
+            'point_cloud': point_cloud_data
+        }
+    
+    def display_results(self, results: dict):
+        """
+        Display all visualization results.
+        
+        Args:
+            results: Results dictionary from process_stereo_images
+        """
+        display_images = {
+            "Rectified Diff": results['difference_visualization'],
+            "Disparity Visual Check": results['disparity_grayscale'],
+            "WLS Disparity Map": results['disparity_colored']
+        }
+        
+        self.visualizer.display_images(display_images)
+        
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+
+
+# Example usage
+def main():
+    """Example usage of the modularized stereo vision pipeline."""
+    try:
+        # Initialize pipeline
+        pipeline = StereoVisionPipeline("opencv_stereo_params.npz")
+        
+        # Process images (choose one method)
+        results = pipeline.process_stereo_images(
+            image_path=r"C:\Users\sybanzon\Documents\schoolFiles\RESERARCH\calibration\WIN_20250708_14_23_01_Pro.jpg",
+            save_point_cloud=True
+        )
+        
+        # Alternative for separate images:
+        # results = pipeline.process_stereo_images(
+        #     left_path=r"C:\Users\pvbas\Music\secret files\scene1.row3.col3.png",
+        #     right_path=r"C:\Users\pvbas\Music\secret files\scene1.row3.col1.png",
+        #     save_point_cloud=True
+        # )
+        
+        # Display results
+        pipeline.display_results(results)
+        
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+if __name__ == "__main__":
+    main()
