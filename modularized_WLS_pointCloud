@@ -486,7 +486,7 @@ def main():
     """Example usage of the modularized stereo vision pipeline."""
     try:
         # Initialize pipeline
-        pipeline = StereoVisionPipeline("opencv_stereo_params.npz")
+        pipeline = StereoVisionPipeline(r"C:\Users\sybanzon\Documents\schoolFiles\RESERARCH\calibration\v0.npz")
         
         # Process images (choose one method)
         results = pipeline.process_stereo_images(
